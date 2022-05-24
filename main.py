@@ -209,7 +209,7 @@ def train():
                     test_loss = 0
                     n_test_loss = 0
                     for x, y in test_dataloader:
-                        test_loss += trainer(x_0).mean().item()
+                        test_loss += trainer(x).mean().item()
                         n_test_loss += 1
 
                     wandb.log({
@@ -217,6 +217,7 @@ def train():
                         "test_loss": test_loss / n_test_loss,
                         "samples": [wandb.Image(grid)],
                     })
+                    writer.add_scalar('test_loss', test_loss / n_test_loss, step)  # WANDB
 
                 net_model.train()
 
