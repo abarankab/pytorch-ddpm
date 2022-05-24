@@ -2,9 +2,11 @@ import copy
 import json
 import os
 import warnings
+import datetime
 from absl import app, flags
 
 import torch
+import wandb
 from tensorboardX import SummaryWriter
 from torchvision.datasets import CIFAR10
 from torchvision.utils import make_grid, save_image
@@ -51,6 +53,9 @@ flags.DEFINE_integer('eval_step', 0, help='frequency of evaluating model, 0 to d
 flags.DEFINE_integer('num_images', 50000, help='the number of generated images for evaluation')
 flags.DEFINE_bool('fid_use_torch', False, help='calculate IS and FID on gpu')
 flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', help='FID cache')
+# Wandb
+flags.DEFINE_string("project_name", "ddpm-cifar-2", help="wandb project name")
+flags.DEFINE_string("run_name", datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M"), help="wandb project name")
 
 device = torch.device('cuda:0')
 
@@ -101,10 +106,22 @@ def train():
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]))
+    
+    test_dataset = CIFAR10(
+        root='./data', train=False, download=True,
+        transform=transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]))
+
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=FLAGS.batch_size, shuffle=True,
         num_workers=FLAGS.num_workers, drop_last=True)
     datalooper = infiniteloop(dataloader)
+
+    test_dataloader = torch.utils.data.DataLoader(
+        dataset, batch_size=256, shuffle=False,
+        num_workers=FLAGS.num_workers, drop_last=True)
 
     # model setup
     net_model = UNet(
@@ -131,9 +148,19 @@ def train():
     x_T = torch.randn(FLAGS.sample_size, 3, FLAGS.img_size, FLAGS.img_size)
     x_T = x_T.to(device)
     grid = (make_grid(next(iter(dataloader))[0][:FLAGS.sample_size]) + 1) / 2
+
+    run = wandb.init(
+        project=flags.project_name,
+        entity='treaptofun',
+        config=vars(FLAGS.__flags),
+        name=flags.run_name,
+    )
+    wandb.watch(net_model)
+
     writer = SummaryWriter(FLAGS.logdir)
     writer.add_image('real_sample', grid)
     writer.flush()
+
     # backup all arguments
     with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
         f.write(FLAGS.flags_into_string())
@@ -143,6 +170,9 @@ def train():
         model_size += param.data.nelement()
     print('Model params: %.2f M' % (model_size / 1024 / 1024))
 
+    loss_wandb = 0
+    n_loss_wandb = 0
+
     # start training
     with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
         for step in pbar:
@@ -151,6 +181,10 @@ def train():
             x_0 = next(datalooper).to(device)
             loss = trainer(x_0).mean()
             loss.backward()
+
+            loss_wandb += loss.item()
+            n_loss_wandb += 1
+
             torch.nn.utils.clip_grad_norm_(
                 net_model.parameters(), FLAGS.grad_clip)
             optim.step()
@@ -158,7 +192,7 @@ def train():
             ema(net_model, ema_model, FLAGS.ema_decay)
 
             # log
-            writer.add_scalar('loss', loss, step)
+            writer.add_scalar('loss', loss, step)  # WANDB
             pbar.set_postfix(loss='%.3f' % loss)
 
             # sample
@@ -170,7 +204,20 @@ def train():
                     path = os.path.join(
                         FLAGS.logdir, 'sample', '%d.png' % step)
                     save_image(grid, path)
-                    writer.add_image('sample', grid, step)
+                    writer.add_image('sample', grid, step)  # WANDB
+
+                    test_loss = 0
+                    n_test_loss = 0
+                    for x, y in test_dataloader:
+                        test_loss += trainer(x_0).mean().item()
+                        n_test_loss += 1
+
+                    wandb.log({
+                        "train_loss": loss_wandb / n_loss_wandb,
+                        "test_loss": test_loss / n_test_loss,
+                        "samples": [wandb.Image(grid)],
+                    })
+
                 net_model.train()
 
             # save
