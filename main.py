@@ -150,10 +150,10 @@ def train():
     grid = (make_grid(next(iter(dataloader))[0][:FLAGS.sample_size]) + 1) / 2
 
     run = wandb.init(
-        project=flags.project_name,
+        project=FLAGS.project_name,
         entity='treaptofun',
         config=vars(FLAGS.__flags),
-        name=flags.run_name,
+        name=FLAGS.run_name,
     )
     wandb.watch(net_model)
 
