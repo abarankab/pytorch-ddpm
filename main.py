@@ -54,10 +54,11 @@ flags.DEFINE_integer('num_images', 50000, help='the number of generated images f
 flags.DEFINE_bool('fid_use_torch', False, help='calculate IS and FID on gpu')
 flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', help='FID cache')
 # Wandb
+flags.DEFINE_bool("log_to_wandb", True, help="if True logs to wandb")
 flags.DEFINE_string("project_name", "ddpm-cifar-2", help="wandb project name")
-flags.DEFINE_string("run_name", datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M"), help="wandb project name")
+flags.DEFINE_string("run_name", datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M"), help="wandb run name")
 
-device = torch.device('cuda:0')
+device = torch.device('cuda')
 
 
 def ema(source, target, decay):
@@ -150,9 +151,10 @@ def train():
     grid = (make_grid(next(iter(dataloader))[0][:FLAGS.sample_size]) + 1) / 2
 
     run = wandb.init(
+        dir="/home/jupyter/work/resources/wandb_dir",
         project=FLAGS.project_name,
         entity='treaptofun',
-        config=vars(FLAGS.__flags),
+        config=FLAGS.flag_values_dict(),
         name=FLAGS.run_name,
     )
     wandb.watch(net_model)
@@ -209,6 +211,7 @@ def train():
                     test_loss = 0
                     n_test_loss = 0
                     for x, y in test_dataloader:
+                        x = x.to(device)
                         test_loss += trainer(x).mean().item()
                         n_test_loss += 1
 
