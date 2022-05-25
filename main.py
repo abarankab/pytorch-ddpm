@@ -225,7 +225,7 @@ def train():
                 net_model.train()
 
             # save
-            if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
+            if FLAGS.save_step > 0 and (step + 1) % FLAGS.save_step == 0:
                 ckpt = {
                     'net_model': net_model.state_dict(),
                     'ema_model': ema_model.state_dict(),
@@ -234,10 +234,10 @@ def train():
                     'step': step,
                     'x_T': x_T,
                 }
-                torch.save(ckpt, os.path.join(FLAGS.logdir, 'ckpt.pt'))
+                torch.save(ckpt, os.path.join(FLAGS.logdir, f'ckpt{step}.pt'))
 
             # evaluate
-            if FLAGS.eval_step > 0 and step % FLAGS.eval_step == 0:
+            if FLAGS.eval_step > 0 and (step + 1) % FLAGS.eval_step == 0:
                 net_IS, net_FID, _ = evaluate(net_sampler, net_model)
                 ema_IS, ema_FID, _ = evaluate(ema_sampler, ema_model)
                 metrics = {
