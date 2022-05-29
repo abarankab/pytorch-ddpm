@@ -1,6 +1,9 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from resample import get_named_sampler
 
 
 def extract(v, t, x_shape):
@@ -13,11 +16,15 @@ def extract(v, t, x_shape):
 
 
 class GaussianDiffusionTrainer(nn.Module):
-    def __init__(self, model, beta_1, beta_T, T):
+    def __init__(self, model, beta_1, beta_T, T, sampler_name, reweight_loss, update_loss_steps=0):
         super().__init__()
 
         self.model = model
         self.T = T
+        self.sampler_name = sampler_name
+        self.sampler = get_named_sampler(sampler_name)
+        self.reweight_loss = reweight_loss
+        self.update_loss_steps = update_loss_steps
 
         self.register_buffer(
             'betas', torch.linspace(beta_1, beta_T, T).double())
@@ -34,16 +41,46 @@ class GaussianDiffusionTrainer(nn.Module):
         """
         Algorithm 1.
         """
-        t = torch.randint(self.T, size=(x_0.shape[0], ), device=x_0.device)
+        t, sampler_weights = self.sampler.sample(self.T, batch_size=x_0.shape[0], device=x_0.device)
         noise = torch.randn_like(x_0)
         x_t = (
             extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
             extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
         loss = F.mse_loss(self.model(x_t, t), noise, reduction='none')
+
+        self.sampler.update_with_all_losses(
+            t.tolist(),
+            loss.view(loss.shape[0], -1).mean(axis=1).tolist(),
+        )
+
+        loss = loss.view(loss.shape[0], -1).mean(axis=1) * sampler_weights
+
+        if self.reweight_loss and self.sampler._warmed_up():
+            weights = np.sqrt(np.mean(self.sampler._loss_history ** 2, axis=-1))
+            weights = torch.from_numpy(weights).float().to(x_0.device)
+            weights = weights[t]
+            weights /= weights.sum()
+            weights *= len(weights)
+            assert torch.abs(weights.sum() - x_0.shape[0]) <= 1e-6
+            loss *= weights
+        
+        with torch.no_grad():
+            for _ in range(self.update_loss_steps):
+                t, sampler_weights = self.sampler.sample(self.T, batch_size=(x_0.shape[0]), device=x_0.device)
+                noise = torch.randn_like(x_0)
+                x_t = (
+                    extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
+                    extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
+                loss_temp = F.mse_loss(self.model(x_t, t), noise, reduction='none')
+                self.sampler.update_with_all_losses(
+                    t.tolist(),
+                    loss_temp.view(loss.shape[0], -1).mean(axis=1).tolist(),
+                )
+
         return loss
     
     @torch.no_grad()
-    def get_true_loss(self, x_0):
+    def get_true_loss(self, x_0, return_t=False):
         """
         Gets true loss from Algorithm 1. No gradient. 
         """
@@ -53,7 +90,10 @@ class GaussianDiffusionTrainer(nn.Module):
             extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
             extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
         loss = F.mse_loss(self.model(x_t, t), noise, reduction='none')
-        return loss
+        if not return_t:
+            return loss
+        else:
+            return loss, t
 
 
 class GaussianDiffusionSampler(nn.Module):

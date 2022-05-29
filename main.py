@@ -3,6 +3,7 @@ import json
 import os
 import warnings
 import datetime
+
 from absl import app, flags
 
 import torch
@@ -11,7 +12,6 @@ from tensorboardX import SummaryWriter
 from torchvision.datasets import CIFAR10
 from torchvision.utils import make_grid, save_image
 from torchvision import transforms
-from tqdm import trange
 
 from diffusion import GaussianDiffusionTrainer, GaussianDiffusionSampler
 from model import UNet
@@ -43,6 +43,9 @@ flags.DEFINE_integer('batch_size', 128, help='batch size')
 flags.DEFINE_integer('num_workers', 4, help='workers of Dataloader')
 flags.DEFINE_float('ema_decay', 0.9999, help="ema decay rate")
 flags.DEFINE_bool('parallel', False, help='multi gpu training')
+flags.DEFINE_string('sampler_name', None, help='t sampler name')
+flags.DEFINE_bool('reweight_loss', None, help='reweights loss if True')
+flags.DEFINE_integer('update_loss_steps', 0, help='additional loss updates')
 # Logging & Sampling
 flags.DEFINE_string('logdir', './logs/DDPM_CIFAR10_EPS', help='log directory')
 flags.DEFINE_integer('sample_size', 64, "sampling size of images")
@@ -128,7 +131,7 @@ def train():
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
     trainer = GaussianDiffusionTrainer(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T).to(device)
+        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.sampler_name, FLAGS.reweight_loss, FLAGS.update_loss_step).to(device)
     net_sampler = GaussianDiffusionSampler(
         net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
         FLAGS.mean_type, FLAGS.var_type).to(device)
@@ -166,15 +169,15 @@ def train():
 
     loss_wandb = 0
     n_loss_wandb = 0
+    loss_compare = 0
+    n_loss_compare = 0
 
-    init_step = None
     if FLAGS.ckpt_filename is not None:
         ckpt = torch.load(FLAGS.ckpt_filename)
         net_model.load_state_dict(ckpt['net_model'])
         ema_model.load_state_dict(ckpt['ema_model'])
         sched.load_state_dict(ckpt['sched'])
         optim.load_state_dict(ckpt['optim'])
-        init_step = ckpt['step']
         x_T = ckpt['x_T']
 
     # start training
@@ -184,6 +187,9 @@ def train():
         x_0 = next(datalooper).to(device)
         loss = trainer(x_0).mean()
         loss.backward()
+
+        loss_compare += trainer.get_true_loss(x_0).mean().item()
+        n_loss_compare += 1
 
         loss_wandb += loss.item()
         n_loss_wandb += 1
@@ -212,10 +218,16 @@ def train():
                     n_test_loss += 1
 
                 wandb.log({
-                    "train_loss": loss_wandb / n_loss_wandb,
+                    "compare_loss": loss_compare / n_loss_compare,
                     "test_loss": test_loss / n_test_loss,
                     "samples": [wandb.Image(grid)],
+                    "train_loss": loss_wandb / n_loss_wandb,
                 })
+
+                loss_wandb = 0
+                n_loss_wandb = 0
+                loss_compare = 0
+                n_loss_compare = 0
 
             net_model.train()
 
