@@ -53,10 +53,12 @@ flags.DEFINE_integer('eval_step', 0, help='frequency of evaluating model, 0 to d
 flags.DEFINE_integer('num_images', 50000, help='the number of generated images for evaluation')
 flags.DEFINE_bool('fid_use_torch', False, help='calculate IS and FID on gpu')
 flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', help='FID cache')
+flags.DEFINE_bool('sample_net', False, help='if True also draws samples from net model')
 # Wandb
 flags.DEFINE_bool("log_to_wandb", True, help="if True logs to wandb")
 flags.DEFINE_string("project_name", "ddpm-cifar-2", help="wandb project name")
 flags.DEFINE_string("run_name", datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M"), help="wandb run name")
+flags.DEFINE_string("ckpt_filename", None, help="checkpoint filename")
 
 device = torch.device('cuda')
 
@@ -85,7 +87,8 @@ def evaluate(sampler, model):
     with torch.no_grad():
         images = []
         desc = "generating images"
-        for i in trange(0, FLAGS.num_images, FLAGS.batch_size, desc=desc):
+        for i in range(0, FLAGS.num_images, FLAGS.batch_size):
+            wandb.log({"step": i, "images": len(images) * FLAGS.batch_size})
             batch_size = min(FLAGS.batch_size, FLAGS.num_images - i)
             x_T = torch.randn((batch_size, 3, FLAGS.img_size, FLAGS.img_size))
             batch_images = sampler(x_T.to(device)).cpu()
@@ -104,13 +107,6 @@ def train():
         root='./data', train=True, download=True,
         transform=transforms.Compose([
             transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]))
-    
-    test_dataset = CIFAR10(
-        root='./data', train=False, download=True,
-        transform=transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]))
@@ -144,6 +140,7 @@ def train():
         net_sampler = torch.nn.DataParallel(net_sampler)
         ema_sampler = torch.nn.DataParallel(ema_sampler)
 
+
     # log setup
     os.makedirs(os.path.join(FLAGS.logdir, 'sample'))
     x_T = torch.randn(FLAGS.sample_size, 3, FLAGS.img_size, FLAGS.img_size)
@@ -151,17 +148,12 @@ def train():
     grid = (make_grid(next(iter(dataloader))[0][:FLAGS.sample_size]) + 1) / 2
 
     run = wandb.init(
-        dir="/home/jupyter/work/resources/wandb_dir",
         project=FLAGS.project_name,
         entity='treaptofun',
         config=FLAGS.flag_values_dict(),
         name=FLAGS.run_name,
     )
     wandb.watch(net_model)
-
-    writer = SummaryWriter(FLAGS.logdir)
-    writer.add_image('real_sample', grid)
-    writer.flush()
 
     # backup all arguments
     with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
@@ -175,92 +167,95 @@ def train():
     loss_wandb = 0
     n_loss_wandb = 0
 
+    init_step = None
+    if FLAGS.ckpt_filename is not None:
+        ckpt = torch.load(FLAGS.ckpt_filename)
+        net_model.load_state_dict(ckpt['net_model'])
+        ema_model.load_state_dict(ckpt['ema_model'])
+        sched.load_state_dict(ckpt['sched'])
+        optim.load_state_dict(ckpt['optim'])
+        init_step = ckpt['step']
+        x_T = ckpt['x_T']
+
     # start training
-    with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
-        for step in pbar:
-            # train
-            optim.zero_grad()
-            x_0 = next(datalooper).to(device)
-            loss = trainer(x_0).mean()
-            loss.backward()
+    for step in range(FLAGS.total_steps):
+        # train
+        optim.zero_grad()
+        x_0 = next(datalooper).to(device)
+        loss = trainer(x_0).mean()
+        loss.backward()
 
-            loss_wandb += loss.item()
-            n_loss_wandb += 1
+        loss_wandb += loss.item()
+        n_loss_wandb += 1
 
-            torch.nn.utils.clip_grad_norm_(
-                net_model.parameters(), FLAGS.grad_clip)
-            optim.step()
-            sched.step()
-            ema(net_model, ema_model, FLAGS.ema_decay)
+        torch.nn.utils.clip_grad_norm_(
+            net_model.parameters(), FLAGS.grad_clip)
+        optim.step()
+        sched.step()
+        ema(net_model, ema_model, FLAGS.ema_decay)
 
-            # log
-            writer.add_scalar('loss', loss, step)  # WANDB
-            pbar.set_postfix(loss='%.3f' % loss)
+        # sample
+        if FLAGS.sample_step > 0 and step % FLAGS.sample_step == 0:
+            net_model.eval()
+            with torch.no_grad():
+                x_0 = ema_sampler(x_T)
+                grid = (make_grid(x_0) + 1) / 2
+                path = os.path.join(
+                    FLAGS.logdir, 'sample', '%d.png' % step)
+                save_image(grid, path)
 
-            # sample
-            if FLAGS.sample_step > 0 and step % FLAGS.sample_step == 0:
-                net_model.eval()
-                with torch.no_grad():
-                    x_0 = ema_sampler(x_T)
-                    grid = (make_grid(x_0) + 1) / 2
-                    path = os.path.join(
-                        FLAGS.logdir, 'sample', '%d.png' % step)
-                    save_image(grid, path)
-                    writer.add_image('sample', grid, step)  # WANDB
+                test_loss = 0
+                n_test_loss = 0
+                for x, y in test_dataloader:
+                    x = x.to(device)
+                    test_loss += trainer.get_true_loss(x).mean().item()
+                    n_test_loss += 1
 
-                    test_loss = 0
-                    n_test_loss = 0
-                    for x, y in test_dataloader:
-                        x = x.to(device)
-                        test_loss += trainer(x).mean().item()
-                        n_test_loss += 1
+                wandb.log({
+                    "train_loss": loss_wandb / n_loss_wandb,
+                    "test_loss": test_loss / n_test_loss,
+                    "samples": [wandb.Image(grid)],
+                })
 
-                    wandb.log({
-                        "train_loss": loss_wandb / n_loss_wandb,
-                        "test_loss": test_loss / n_test_loss,
-                        "samples": [wandb.Image(grid)],
-                    })
-                    writer.add_scalar('test_loss', test_loss / n_test_loss, step)  # WANDB
+            net_model.train()
 
-                net_model.train()
+        # save
+        if FLAGS.save_step > 0 and (step + 1) % FLAGS.save_step == 0:
+            ckpt = {
+                'net_model': net_model.state_dict(),
+                'ema_model': ema_model.state_dict(),
+                'sched': sched.state_dict(),
+                'optim': optim.state_dict(),
+                'step': step,
+                'x_T': x_T,
+            }
+            torch.save(ckpt, os.path.join(FLAGS.logdir, f'ckpt{step}.pt'))
 
-            # save
-            if FLAGS.save_step > 0 and (step + 1) % FLAGS.save_step == 0:
-                ckpt = {
-                    'net_model': net_model.state_dict(),
-                    'ema_model': ema_model.state_dict(),
-                    'sched': sched.state_dict(),
-                    'optim': optim.state_dict(),
-                    'step': step,
-                    'x_T': x_T,
-                }
-                torch.save(ckpt, os.path.join(FLAGS.logdir, f'ckpt{step}.pt'))
-
-            # evaluate
-            if FLAGS.eval_step > 0 and (step + 1) % FLAGS.eval_step == 0:
-                net_IS, net_FID, _ = evaluate(net_sampler, net_model)
-                ema_IS, ema_FID, _ = evaluate(ema_sampler, ema_model)
-                metrics = {
-                    'IS': net_IS[0],
-                    'IS_std': net_IS[1],
-                    'FID': net_FID,
-                    'IS_EMA': ema_IS[0],
-                    'IS_std_EMA': ema_IS[1],
-                    'FID_EMA': ema_FID
-                }
-                pbar.write(
-                    "%d/%d " % (step, FLAGS.total_steps) +
-                    ", ".join('%s:%.3f' % (k, v) for k, v in metrics.items()))
-                for name, value in metrics.items():
-                    writer.add_scalar(name, value, step)
-                writer.flush()
-                with open(os.path.join(FLAGS.logdir, 'eval.txt'), 'a') as f:
-                    metrics['step'] = step
-                    f.write(json.dumps(metrics) + "\n")
-    writer.close()
+        # evaluate
+        if FLAGS.eval_step > 0 and (step + 1) % FLAGS.eval_step == 0:
+            net_IS, net_FID, _ = evaluate(net_sampler, net_model)
+            ema_IS, ema_FID, _ = evaluate(ema_sampler, ema_model)
+            metrics = {
+                'IS': net_IS[0],
+                'IS_std': net_IS[1],
+                'FID': net_FID,
+                'IS_EMA': ema_IS[0],
+                'IS_std_EMA': ema_IS[1],
+                'FID_EMA': ema_FID
+            }
+            with open(os.path.join(FLAGS.logdir, 'eval.txt'), 'a') as f:
+                metrics['step'] = step
+                f.write(json.dumps(metrics) + "\n")
 
 
 def eval():
+    run = wandb.init(
+        project="ddpm-eval",
+        entity='treaptofun',
+        config=FLAGS.flag_values_dict(),
+        name=FLAGS.run_name,
+    )
+
     # model setup
     model = UNet(
         T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
@@ -272,22 +267,28 @@ def eval():
         sampler = torch.nn.DataParallel(sampler)
 
     # load model and evaluate
-    ckpt = torch.load(os.path.join(FLAGS.logdir, 'ckpt.pt'))
-    model.load_state_dict(ckpt['net_model'])
-    (IS, IS_std), FID, samples = evaluate(sampler, model)
-    print("Model     : IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
-    save_image(
-        torch.tensor(samples[:256]),
-        os.path.join(FLAGS.logdir, 'samples.png'),
-        nrow=16)
+    ckpt = torch.load(FLAGS.ckpt_filename)
+
+    if FLAGS.sample_net:
+        model.load_state_dict(ckpt['net_model'])
+        (IS, IS_std), FID, samples = evaluate(sampler, model)
+        wandb.log({"IS": IS, "IS_STD": IS_std, "FID": FID})
+        print("Model     : IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
+        save_image(
+            torch.tensor(samples[:256]),
+            os.path.join(FLAGS.logdir, 'samples.png'),
+            nrow=16)
+        wandb.log({"samples": [wandb.Image(make_grid(torch.tensor(samples[:256])))]})
 
     model.load_state_dict(ckpt['ema_model'])
     (IS, IS_std), FID, samples = evaluate(sampler, model)
+    wandb.log({"IS(EMA)": IS, "IS_STD(EMA)": IS_std, "FID(EMA)": FID})
     print("Model(EMA): IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
     save_image(
         torch.tensor(samples[:256]),
         os.path.join(FLAGS.logdir, 'samples_ema.png'),
         nrow=16)
+    wandb.log({"samples(EMA)": [wandb.Image(make_grid(torch.tensor(samples[:256])))]})
 
 
 def main(argv):
