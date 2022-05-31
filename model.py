@@ -75,6 +75,24 @@ class UpSample(nn.Module):
         return x
 
 
+class SE(nn.Module):
+    def __init__(self, in_ch, out_ch, expansion=0.25):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(out_ch, int(in_ch * expansion), bias=False),
+            Swish(),
+            nn.Linear(int(in_ch * expansion), out_ch, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
 class AttnBlock(nn.Module):
     def __init__(self, in_ch):
         super().__init__()
@@ -158,8 +176,75 @@ class ResBlock(nn.Module):
         return h
 
 
+class MBConv(nn.Module):
+    def __init__(self, in_ch, out_ch, tdim, dropout, expansion=4, attn=False):
+        super().__init__()
+        hidden_dim = int(in_ch * expansion)
+
+        self.block1 = nn.Sequential(
+            # pw
+            # down-sample in the first conv
+            nn.GroupNorm(32, in_ch),
+            Swish(),
+            nn.Conv2d(in_ch, hidden_dim, 1, 1, 0, bias=False),
+        )
+
+        self.temb_proj = nn.Sequential(
+            Swish(),
+            nn.Linear(tdim, hidden_dim),
+        )
+
+        self.block2 = nn.Sequential(
+            # dw
+            nn.GroupNorm(32, hidden_dim),
+            Swish(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1,
+                        groups=hidden_dim, bias=False),
+            nn.GroupNorm(32, hidden_dim),
+            Swish(),
+            SE(in_ch, hidden_dim),
+            # pw-linear
+            nn.Dropout(dropout),
+            nn.Conv2d(hidden_dim, out_ch, 1, 1, 0, bias=False),
+        )
+
+        if in_ch != out_ch:
+            self.shortcut = nn.Conv2d(in_ch, out_ch, 1, stride=1, padding=0)
+        else:
+            self.shortcut = nn.Identity()
+        if attn:
+            self.attn = AttnBlock(out_ch)
+        else:
+            self.attn = nn.Identity()
+
+    def initialize(self):
+        for module in self.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                init.xavier_uniform_(module.weight)
+                init.zeros_(module.bias)
+        init.xavier_uniform_(self.block2[-1].weight, gain=1e-5)
+
+    def forward(self, x, temb):
+        h = self.block1(x)
+        h += self.temb_proj(temb)[:, :, None, None]
+        h = self.block2(h)
+
+        h = h + self.shortcut(x)
+        h = self.attn(h)
+        return h
+
+
+def get_named_conv_block(block_name, **kwargs):
+    if block_name == "residual":
+        return ResBlock(**kwargs)
+    elif block_name == "MBConv":
+        return MBConv(**kwargs)
+    else:
+        raise NotImplementedError()
+
+
 class UNet(nn.Module):
-    def __init__(self, T, ch, ch_mult, attn, num_res_blocks, dropout):
+    def __init__(self, T, ch, ch_mult, attn, num_res_blocks, dropout, conv_block_name):
         super().__init__()
         assert all([i < len(ch_mult) for i in attn]), 'attn index out of bound'
         tdim = ch * 4
@@ -172,7 +257,7 @@ class UNet(nn.Module):
         for i, mult in enumerate(ch_mult):
             out_ch = ch * mult
             for _ in range(num_res_blocks):
-                self.downblocks.append(ResBlock(
+                self.downblocks.append(get_named_conv_block(conv_block_name,
                     in_ch=now_ch, out_ch=out_ch, tdim=tdim,
                     dropout=dropout, attn=(i in attn)))
                 now_ch = out_ch
@@ -182,15 +267,15 @@ class UNet(nn.Module):
                 chs.append(now_ch)
 
         self.middleblocks = nn.ModuleList([
-            ResBlock(now_ch, now_ch, tdim, dropout, attn=True),
-            ResBlock(now_ch, now_ch, tdim, dropout, attn=False),
+            get_named_conv_block(conv_block_name, now_ch, now_ch, tdim, dropout, attn=True),
+            get_named_conv_block(conv_block_name, now_ch, now_ch, tdim, dropout, attn=False),
         ])
 
         self.upblocks = nn.ModuleList()
         for i, mult in reversed(list(enumerate(ch_mult))):
             out_ch = ch * mult
             for _ in range(num_res_blocks + 1):
-                self.upblocks.append(ResBlock(
+                self.upblocks.append(get_named_conv_block(conv_block_name,
                     in_ch=chs.pop() + now_ch, out_ch=out_ch, tdim=tdim,
                     dropout=dropout, attn=(i in attn)))
                 now_ch = out_ch
