@@ -27,6 +27,7 @@ flags.DEFINE_multi_integer('ch_mult', [1, 2, 2, 2], help='channel multiplier')
 flags.DEFINE_multi_integer('attn', [1], help='add attention to these levels')
 flags.DEFINE_integer('num_res_blocks', 2, help='# resblock in each level')
 flags.DEFINE_float('dropout', 0.1, help='dropout rate of resblock')
+flags.DEFINE_string('conv_block_name', None, help='conv block name (residual, mbconv)')
 # Gaussian Diffusion
 flags.DEFINE_float('beta_1', 1e-4, help='start beta value')
 flags.DEFINE_float('beta_T', 0.02, help='end beta value')
@@ -126,12 +127,12 @@ def train():
     # model setup
     net_model = UNet(
         T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
-        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
+        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name)
     ema_model = copy.deepcopy(net_model)
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
     trainer = GaussianDiffusionTrainer(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.sampler_name, FLAGS.reweight_loss, FLAGS.update_loss_step).to(device)
+        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.sampler_name, FLAGS.reweight_loss, FLAGS.update_loss_steps).to(device)
     net_sampler = GaussianDiffusionSampler(
         net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
         FLAGS.mean_type, FLAGS.var_type).to(device)
@@ -271,7 +272,7 @@ def eval():
     # model setup
     model = UNet(
         T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
-        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
+        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name)
     sampler = GaussianDiffusionSampler(
         model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, img_size=FLAGS.img_size,
         mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
