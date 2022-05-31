@@ -33,6 +33,7 @@ flags.DEFINE_float('beta_T', 0.02, help='end beta value')
 flags.DEFINE_integer('T', 1000, help='total diffusion steps')
 flags.DEFINE_enum('mean_type', 'epsilon', ['xprev', 'xstart', 'epsilon'], help='predict variable')
 flags.DEFINE_enum('var_type', 'fixedlarge', ['fixedlarge', 'fixedsmall'], help='variance type')
+flags.DEFINE_integer('iwdiff_order', 1, help='number of IWDIFF steps')
 # Training
 flags.DEFINE_float('lr', 2e-4, help='target learning rate')
 flags.DEFINE_float('grad_clip', 1., help="gradient norm clipping")
@@ -124,6 +125,7 @@ def train():
         num_workers=FLAGS.num_workers, drop_last=True)
 
     # model setup
+    print(FLAGS.iwdiff_order)
     net_model = UNet(
         T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
         num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
@@ -131,7 +133,9 @@ def train():
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
     trainer = GaussianDiffusionTrainer(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.sampler_name, FLAGS.reweight_loss, FLAGS.update_loss_step).to(device)
+        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T,
+        FLAGS.sampler_name, FLAGS.reweight_loss, FLAGS.update_loss_steps,
+        iwdiff_order=FLAGS.iwdiff_order).to(device)
     net_sampler = GaussianDiffusionSampler(
         net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
         FLAGS.mean_type, FLAGS.var_type).to(device)

@@ -40,26 +40,37 @@ class ScheduleSampler(ABC):
 
 
 class UniformSampler(ScheduleSampler):
-    def __init__(self, T, history_per_term=10, uniform_prob=0.001):
+    def __init__(self, T, track_loss_history, history_per_term=10, uniform_prob=0.001):
         self.history_per_term = history_per_term
         self.uniform_prob = uniform_prob
         self._weights = np.ones([T])
+        self.T = T
+        self.track_loss_history = track_loss_history
+        if track_loss_history:
+            self._loss_history = np.zeros(
+                [T, history_per_term], dtype=np.float64
+            )
+            self._loss_counts = np.zeros([T], dtype=np.int)
 
     def weights(self):
         return self._weights
 
     def update_with_all_losses(self, ts, losses):
-        for t, loss in zip(ts, losses):
-            if self._loss_counts[t] == self.history_per_term:
-                # Shift out the oldest loss term.
-                self._loss_history[t, :-1] = self._loss_history[t, 1:]
-                self._loss_history[t, -1] = loss
-            else:
-                self._loss_history[t, self._loss_counts[t]] = loss
-                self._loss_counts[t] += 1
+        if self.track_loss_history:
+            for t, loss in zip(ts, losses):
+                if self._loss_counts[t] == self.history_per_term:
+                    # Shift out the oldest loss term.
+                    self._loss_history[t, :-1] = self._loss_history[t, 1:]
+                    self._loss_history[t, -1] = loss
+                else:
+                    self._loss_history[t, self._loss_counts[t]] = loss
+                    self._loss_counts[t] += 1
 
     def _warmed_up(self):
-        return (self._loss_counts == self.history_per_term).all()
+        if not self.track_loss_history:
+            return False
+        else:
+            return (self._loss_counts == self.history_per_term).all()
 
 
 class LossSecondMomentResampler(ScheduleSampler):
@@ -70,10 +81,11 @@ class LossSecondMomentResampler(ScheduleSampler):
             [T, history_per_term], dtype=np.float64
         )
         self._loss_counts = np.zeros([T], dtype=np.int)
+        self.T = T
 
     def weights(self):
         if not self._warmed_up():
-            return np.ones([self.diffusion.num_timesteps], dtype=np.float64)
+            return np.ones([self.T], dtype=np.float64)
         weights = np.sqrt(np.mean(self._loss_history ** 2, axis=-1))
         weights /= np.sum(weights)
         weights *= 1 - self.uniform_prob
@@ -95,10 +107,10 @@ class LossSecondMomentResampler(ScheduleSampler):
 
 
 
-def get_named_sampler(sampler, T):
+def get_named_sampler(sampler, T, track_loss_history):
     if sampler == "importance":
         return LossSecondMomentResampler(T)
     elif sampler == "uniform":
-        return UniformSampler(T)
+        return UniformSampler(T, track_loss_history)
     else:
         raise NotImplementedError()

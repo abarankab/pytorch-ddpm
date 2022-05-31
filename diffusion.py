@@ -16,15 +16,16 @@ def extract(v, t, x_shape):
 
 
 class GaussianDiffusionTrainer(nn.Module):
-    def __init__(self, model, beta_1, beta_T, T, sampler_name, reweight_loss, update_loss_steps=0):
+    def __init__(self, model, beta_1, beta_T, T, sampler_name, reweight_loss, update_loss_steps=0, iwdiff_order=1):
         super().__init__()
 
         self.model = model
         self.T = T
         self.sampler_name = sampler_name
-        self.sampler = get_named_sampler(sampler_name)
+        self.sampler = get_named_sampler(sampler_name, T, reweight_loss)
         self.reweight_loss = reweight_loss
         self.update_loss_steps = update_loss_steps
+        self.iwdiff_order = iwdiff_order
 
         self.register_buffer(
             'betas', torch.linspace(beta_1, beta_T, T).double())
@@ -36,24 +37,44 @@ class GaussianDiffusionTrainer(nn.Module):
             'sqrt_alphas_bar', torch.sqrt(alphas_bar))
         self.register_buffer(
             'sqrt_one_minus_alphas_bar', torch.sqrt(1. - alphas_bar))
+        
+    def calc_loss(self, x_0, t, iwdiff_order):
+        if iwdiff_order > 1:
+            losses = []
+            for _ in range(iwdiff_order):
+                noise = torch.randn_like(x_0)
+                x_t = (
+                    extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
+                    extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
+                loss = F.mse_loss(self.model(x_t, t), noise, reduction='none').view(x_t.shape[0], -1).mean(axis=1)
+                losses.append(loss)
+            losses = torch.stack(losses)
+            weights = (losses - losses.max(axis=0)[0]).detach().exp()
+            weights = weights / weights.sum(axis=0)
+            losses = (losses * weights).sum(axis=0)
+            assert losses.shape == (x_t.shape[0],)
+            return losses
+        else:
+            noise = torch.randn_like(x_0)
+            x_t = (
+                extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
+                extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
+            loss = F.mse_loss(self.model(x_t, t), noise, reduction='none').view(x_t.shape[0], -1).mean(axis=1)
+            return loss
 
     def forward(self, x_0):
         """
         Algorithm 1.
         """
-        t, sampler_weights = self.sampler.sample(self.T, batch_size=x_0.shape[0], device=x_0.device)
-        noise = torch.randn_like(x_0)
-        x_t = (
-            extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
-            extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
-        loss = F.mse_loss(self.model(x_t, t), noise, reduction='none')
+        t, sampler_weights = self.sampler.sample(batch_size=x_0.shape[0], device=x_0.device)
+        loss = self.calc_loss(x_0, t, self.iwdiff_order)
 
         self.sampler.update_with_all_losses(
             t.tolist(),
-            loss.view(loss.shape[0], -1).mean(axis=1).tolist(),
+            loss.tolist(),
         )
 
-        loss = loss.view(loss.shape[0], -1).mean(axis=1) * sampler_weights
+        loss = loss * sampler_weights
 
         if self.reweight_loss and self.sampler._warmed_up():
             weights = np.sqrt(np.mean(self.sampler._loss_history ** 2, axis=-1))
@@ -61,20 +82,15 @@ class GaussianDiffusionTrainer(nn.Module):
             weights = weights[t]
             weights /= weights.sum()
             weights *= len(weights)
-            assert torch.abs(weights.sum() - x_0.shape[0]) <= 1e-6
             loss *= weights
         
         with torch.no_grad():
             for _ in range(self.update_loss_steps):
-                t, sampler_weights = self.sampler.sample(self.T, batch_size=(x_0.shape[0]), device=x_0.device)
-                noise = torch.randn_like(x_0)
-                x_t = (
-                    extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
-                    extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
-                loss_temp = F.mse_loss(self.model(x_t, t), noise, reduction='none')
+                t, sampler_weights = self.sampler.sample(batch_size=(x_0.shape[0]), device=x_0.device)
+                loss_temp = self.calc_loss(x_0, t, self.iwdiff_order)
                 self.sampler.update_with_all_losses(
                     t.tolist(),
-                    loss_temp.view(loss.shape[0], -1).mean(axis=1).tolist(),
+                    loss_temp.tolist(),
                 )
 
         return loss
