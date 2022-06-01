@@ -310,7 +310,7 @@ class UNet(nn.Module):
             h = layer(h, temb)
         # Upsampling
         for layer in self.upblocks:
-            if isinstance(layer, ResBlock):
+            if isinstance(layer, ResBlock) or isinstance(layer, MBConv):
                 h = torch.cat([h, hs.pop()], dim=1)
             h = layer(h, temb)
         h = self.tail(h)
