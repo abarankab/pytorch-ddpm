@@ -234,11 +234,11 @@ class MBConv(nn.Module):
         return h
 
 
-def get_named_conv_block(block_name, **kwargs):
+def get_named_conv_block(block_name, *args, **kwargs):
     if block_name == "residual":
-        return ResBlock(**kwargs)
+        return ResBlock(*args, **kwargs)
     elif block_name == "MBConv":
-        return MBConv(**kwargs)
+        return MBConv(*args, **kwargs)
     else:
         raise NotImplementedError()
 

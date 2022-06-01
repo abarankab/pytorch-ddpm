@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+from statistics import mode
 import warnings
 import datetime
 
@@ -87,8 +88,9 @@ def warmup_lr(step):
     return min(step, FLAGS.warmup) / FLAGS.warmup
 
 
-def evaluate(sampler, model):
-    model.eval()
+def evaluate(sampler, models):
+    models[0].eval()
+    models[1].eval()
     with torch.no_grad():
         images = []
         desc = "generating images"
@@ -99,7 +101,8 @@ def evaluate(sampler, model):
             batch_images = sampler(x_T.to(device)).cpu()
             images.append((batch_images + 1) / 2)
         images = torch.cat(images, dim=0).numpy()
-    model.train()
+    models[0].train()
+    models[1].train()
     (IS, IS_std), FID = get_inception_and_fid_score(
         images, FLAGS.fid_cache, num_images=FLAGS.num_images,
         use_torch=FLAGS.fid_use_torch, verbose=True)
@@ -127,21 +130,27 @@ def train():
 
     # model setup
     print(FLAGS.iwdiff_order)
-    net_model = UNet(
+    net_models = [
+        UNet(
         T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
-        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name)
-    ema_model = copy.deepcopy(net_model)
-    optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
-    sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
+        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name),
+        UNet(
+        T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult[:-2],
+        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name),
+    ]
+    ema_models = [copy.deepcopy(model) for model in net_models]
+
+    optims = [torch.optim.Adam(model.parameters(), lr=FLAGS.lr) for model in net_models]
+    scheds = [torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr) for optim in optims]
     trainer = GaussianDiffusionTrainer(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T,
+        net_models, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T,
         FLAGS.sampler_name, FLAGS.reweight_loss, FLAGS.update_loss_steps,
         iwdiff_order=FLAGS.iwdiff_order).to(device)
     net_sampler = GaussianDiffusionSampler(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
+        net_models, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
         FLAGS.mean_type, FLAGS.var_type).to(device)
     ema_sampler = GaussianDiffusionSampler(
-        ema_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
+        ema_models, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
         FLAGS.mean_type, FLAGS.var_type).to(device)
     if FLAGS.parallel:
         trainer = torch.nn.DataParallel(trainer)
@@ -161,36 +170,34 @@ def train():
         config=FLAGS.flag_values_dict(),
         name=FLAGS.run_name,
     )
-    wandb.watch(net_model)
+    wandb.watch(net_models)
 
     # backup all arguments
     with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
         f.write(FLAGS.flags_into_string())
     # show model size
     model_size = 0
-    for param in net_model.parameters():
+    for param in net_models[0].parameters():
         model_size += param.data.nelement()
-    print('Model params: %.2f M' % (model_size / 1024 / 1024))
+    print('Model 0 params: %.2f M' % (model_size / 1024 / 1024))
+
+    model_size = 0
+    for param in net_models[1].parameters():
+        model_size += param.data.nelement()
+    print('Model 1 params: %.2f M' % (model_size / 1024 / 1024))
 
     loss_wandb = 0
     n_loss_wandb = 0
     loss_compare = 0
     n_loss_compare = 0
 
-    if FLAGS.ckpt_filename is not None:
-        ckpt = torch.load(FLAGS.ckpt_filename)
-        net_model.load_state_dict(ckpt['net_model'])
-        ema_model.load_state_dict(ckpt['ema_model'])
-        sched.load_state_dict(ckpt['sched'])
-        optim.load_state_dict(ckpt['optim'])
-        x_T = ckpt['x_T']
-
     # start training
     for step in range(FLAGS.total_steps):
         # train
-        optim.zero_grad()
+        optims[0].zero_grad()
+        optims[1].zero_grad()
         x_0 = next(datalooper).to(device)
-        loss = trainer(x_0).mean()
+        loss, model_id = trainer(x_0).mean()
         loss.backward()
 
         loss_compare += trainer.get_true_loss(x_0).mean().item()
@@ -200,14 +207,16 @@ def train():
         n_loss_wandb += 1
 
         torch.nn.utils.clip_grad_norm_(
-            net_model.parameters(), FLAGS.grad_clip)
-        optim.step()
-        sched.step()
-        ema(net_model, ema_model, FLAGS.ema_decay)
+            net_models[model_id].parameters(), FLAGS.grad_clip)
+        optims[model_id].step()
+        scheds[model_id].step()
+        ema(net_models[model_id], ema_models[model_id], FLAGS.ema_decay)
 
         # sample
         if FLAGS.sample_step > 0 and step % FLAGS.sample_step == 0:
-            net_model.eval()
+            net_models[0].eval()
+            net_models[1].eval()
+
             with torch.no_grad():
                 x_0 = ema_sampler(x_T)
                 grid = (make_grid(x_0) + 1) / 2
@@ -219,7 +228,7 @@ def train():
                 n_test_loss = 0
                 for x, y in test_dataloader:
                     x = x.to(device)
-                    test_loss += trainer.get_true_loss(x).mean().item()
+                    test_loss, model_id += trainer.get_true_loss(x).mean().item()
                     n_test_loss += 1
 
                 wandb.log({
@@ -234,15 +243,20 @@ def train():
                 loss_compare = 0
                 n_loss_compare = 0
 
-            net_model.train()
+            net_models[0].train()
+            net_models[1].train()
 
         # save
         if FLAGS.save_step > 0 and (step + 1) % FLAGS.save_step == 0:
             ckpt = {
-                'net_model': net_model.state_dict(),
-                'ema_model': ema_model.state_dict(),
-                'sched': sched.state_dict(),
-                'optim': optim.state_dict(),
+                'net_model_0': net_models[0].state_dict(),
+                'net_model_1': net_models[1].state_dict(),
+                'ema_model_0': ema_models[0].state_dict(),
+                'ema_model_1': ema_models[1].state_dict(),
+                'sched_0': scheds[0].state_dict(),
+                'sched_1': scheds[1].state_dict(),
+                'optim_0': optims[0].state_dict(),
+                'optim_1': optims[0].state_dict(),
                 'step': step,
                 'x_T': x_T,
             }
@@ -250,12 +264,12 @@ def train():
 
         # evaluate
         if FLAGS.eval_step > 0 and (step + 1) % FLAGS.eval_step == 0:
-            net_IS, net_FID, _ = evaluate(net_sampler, net_model)
-            ema_IS, ema_FID, _ = evaluate(ema_sampler, ema_model)
+            # net_IS, net_FID, _ = evaluate(net_sampler, net_models)
+            ema_IS, ema_FID, _ = evaluate(ema_sampler, ema_models)
             metrics = {
-                'IS': net_IS[0],
-                'IS_std': net_IS[1],
-                'FID': net_FID,
+                # 'IS': net_IS[0],
+                # 'IS_std': net_IS[1],
+                # 'FID': net_FID,
                 'IS_EMA': ema_IS[0],
                 'IS_std_EMA': ema_IS[1],
                 'FID_EMA': ema_FID
@@ -274,11 +288,16 @@ def eval():
     )
 
     # model setup
-    model = UNet(
+    models = [
+        UNet(
         T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
-        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name)
+        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name),
+        UNet(
+        T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult[:-2],
+        num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout, conv_block_name=FLAGS.conv_block_name),
+    ]
     sampler = GaussianDiffusionSampler(
-        model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, img_size=FLAGS.img_size,
+        models, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, img_size=FLAGS.img_size,
         mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
     if FLAGS.parallel:
         sampler = torch.nn.DataParallel(sampler)
@@ -287,8 +306,9 @@ def eval():
     ckpt = torch.load(FLAGS.ckpt_filename)
 
     if FLAGS.sample_net:
-        model.load_state_dict(ckpt['net_model'])
-        (IS, IS_std), FID, samples = evaluate(sampler, model)
+        models[0].load_state_dict(ckpt['net_model_0'])
+        models[1].load_state_dict(ckpt['net_model_0'])
+        (IS, IS_std), FID, samples = evaluate(sampler, models)
         wandb.log({"IS": IS, "IS_STD": IS_std, "FID": FID})
         print("Model     : IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
         save_image(
@@ -297,8 +317,9 @@ def eval():
             nrow=16)
         wandb.log({"samples": [wandb.Image(make_grid(torch.tensor(samples[:256])))]})
 
-    model.load_state_dict(ckpt['ema_model'])
-    (IS, IS_std), FID, samples = evaluate(sampler, model)
+    models[0].load_state_dict(ckpt['ema_model_0'])
+    models[1].load_state_dict(ckpt['ema_model_1'])
+    (IS, IS_std), FID, samples = evaluate(sampler, models)
     wandb.log({"IS(EMA)": IS, "IS_STD(EMA)": IS_std, "FID(EMA)": FID})
     print("Model(EMA): IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
     save_image(
