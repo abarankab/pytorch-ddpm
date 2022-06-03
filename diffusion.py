@@ -38,6 +38,10 @@ class CombinedGaussianDiffusionSampler(nn.Module):
             'sqrt_recip_alphas_bar', torch.sqrt(1. / alphas_bar))
         self.register_buffer(
             'sqrt_recipm1_alphas_bar', torch.sqrt(1. / alphas_bar - 1))
+        self.register_buffer(
+            'sqrt_alphas_bar', torch.sqrt(alphas_bar))
+        self.register_buffer(
+            'sqrt_one_minus_alphas_bar', torch.sqrt(1. - alphas_bar))
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         self.register_buffer(
@@ -127,12 +131,15 @@ class CombinedGaussianDiffusionSampler(nn.Module):
         """
         Algorithm 2.
         """
-        x_t = F.interpolate(x_T, scale_factor=0.5)
-        for time_step in reversed(range(self.T)):
-            t = x_t.new_ones([x_T.shape[0], ], dtype=torch.long) * time_step
+        noise = torch.randn_like(x_T)
+        x_mid = x_T.clone()
+        x_t = (
+            extract(self.sqrt_alphas_bar, self.midpoint, x_0.shape) * x_T +
+            extract(self.sqrt_one_minus_alphas_bar, self.midpoint, x_T.shape) * noise)
+        x_mid_noisy = x_t.clone()
 
-            if t < self.midpoint:
-                x_t = F.interpolate(x_t, scale_factor=2)
+        for time_step in reversed(range(self.midpoint)):
+            t = x_t.new_ones([x_T.shape[0], ], dtype=torch.long) * time_step
 
             mean, log_var = self.p_mean_variance(x_t=x_t, t=t)
             # no noise when t == 0
@@ -142,4 +149,4 @@ class CombinedGaussianDiffusionSampler(nn.Module):
                 noise = 0
             x_t = mean + torch.exp(0.5 * log_var) * noise
         x_0 = x_t
-        return torch.clip(x_0, -1, 1)
+        return torch.clip(x_0, -1, 1), torch.clip(x_mid, -1, 1), torch.clip(x_mid_noisy, -1, 1)

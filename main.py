@@ -12,6 +12,7 @@ from torchvision.utils import make_grid, save_image
 
 from diffusion import CombinedGaussianDiffusionSampler
 from model import UNet
+from sngan import Generator32
 from score.both import get_inception_and_fid_score
 
 
@@ -63,19 +64,34 @@ flags.DEFINE_float("midpoint_ratio", 0.5, help="when to switch to different spat
 device = torch.device('cuda')
 
 
-def evaluate(sampler, model):
+def evaluate(sampler, model, gan):
     model.eval()
+    gan.eval()
     with torch.no_grad():
         images = []
-        desc = "generating images"
         for i in range(0, FLAGS.num_images, FLAGS.batch_size):
             batch_size = min(FLAGS.batch_size, FLAGS.num_images - i)
-            x_T = torch.randn((batch_size, 3, FLAGS.img_size, FLAGS.img_size))
-            batch_images = sampler(x_T.to(device)).cpu()
+            
+            sample_z = torch.randn(batch_size, 128).to(device)
+            x_T = gan(sample_z)
+
+            batch_images, midpoint_images, mn_images = sampler(x_T.to(device))
+
+            batch_images = batch_images.cpu()
+            midpoint_images = midpoint_images.cpu()
+            mn_images = mn_images.cpu()
+
             images.append((batch_images + 1) / 2)
-            wandb.log({"step": i, "samples": [wandb.Image((make_grid(batch_images) + 1) / 2)]})
+            wandb.log({
+                "step": i,
+                "samples": [wandb.Image((make_grid(batch_images) + 1) / 2)],
+                "midpoint_samples": [wandb.Image((make_grid(midpoint_images) + 1) / 2)],
+                "mn_samples": [wandb.Image((make_grid(mn_images) + 1) / 2)],
+            })
+
         images = torch.cat(images, dim=0).numpy()
     model.train()
+    gan.train()
     (IS, IS_std), FID = get_inception_and_fid_score(
         images, FLAGS.fid_cache, num_images=FLAGS.num_images,
         use_torch=FLAGS.fid_use_torch, verbose=True)
@@ -91,16 +107,14 @@ def eval():
     )
 
     # model setup
-    models = [
-        UNet(
+    model = UNet(
         T=1000, ch=128, ch_mult=[1, 2, 2, 2], attn=[1],
-        num_res_blocks=2, dropout=0.1, conv_block_name="residual"),
-        UNet(
-        T=1000, ch=128, ch_mult=[1, 2, 2], attn=[1],
-        num_res_blocks=2, dropout=0.1, conv_block_name="residual"),
-    ]
+        num_res_blocks=2, dropout=0.1, conv_block_name="residual")
+    gan = Generator32(128)
+
+    print(int(FLAGS.T * FLAGS.midpoint_ratio))
     sampler = CombinedGaussianDiffusionSampler(
-        models, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, midpoint=int(FLAGS.T * FLAGS.midpoint_ratio), img_size=FLAGS.img_size,
+        model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, midpoint=int(FLAGS.T * FLAGS.midpoint_ratio), img_size=FLAGS.img_size,
         mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
     if FLAGS.parallel:
         sampler = torch.nn.DataParallel(sampler)
@@ -109,10 +123,10 @@ def eval():
     ckpt_0 = torch.load(FLAGS.ckpt_filename_0)
     ckpt_1 = torch.load(FLAGS.ckpt_filename_1)
 
-    models[0].load_state_dict(ckpt_0['ema_model'])
-    models[1].load_state_dict(ckpt_1['ema_model'])
+    model.load_state_dict(ckpt_0['ema_model'])
+    gan.load_state_dict(ckpt_1)
 
-    (IS, IS_std), FID, samples = evaluate(sampler, models)
+    (IS, IS_std), FID, samples = evaluate(sampler, model, gan)
     wandb.log({"IS(EMA)": IS, "IS_STD(EMA)": IS_std, "FID(EMA)": FID})
     print("Model(EMA): IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
     save_image(
