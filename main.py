@@ -9,6 +9,7 @@ from absl import app, flags
 import torch
 import wandb
 from torchvision.utils import make_grid, save_image
+from torchvision.io import read_image
 
 from diffusion import CombinedGaussianDiffusionSampler
 from model import UNet
@@ -59,21 +60,21 @@ flags.DEFINE_string("project_name", "ddpm-cifar-2", help="wandb project name")
 flags.DEFINE_string("run_name", datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M"), help="wandb run name")
 flags.DEFINE_string("ckpt_filename_0", None, help="checkpoint filename")
 flags.DEFINE_string("ckpt_filename_1", None, help="checkpoint filename")
-flags.DEFINE_float("midpoint_ratio", 0.5, help="when to switch to different spatial dimension")
+# Surrogate 
+flags.DEFINE_float("midpoint_ratio", None, help="when to switch to different spatial dimension")
+flags.DEFINE_float("img_folder", None, help="path to image folder")
 
 device = torch.device('cuda')
 
 
-def evaluate(sampler, model, gan):
+def evaluate(sampler, model, folder):
     model.eval()
-    gan.eval()
     with torch.no_grad():
         images = []
         for i in range(0, FLAGS.num_images, FLAGS.batch_size):
-            batch_size = min(FLAGS.batch_size, FLAGS.num_images - i)
-            
-            sample_z = torch.randn(batch_size, 128).to(device)
-            x_T = gan(sample_z)
+            x_T = torch.stack([
+                read_image(os.path.join(folder, f"{j}.png")) for j in range(i, min(FLAGS.num_images, i + FLAGS.batch_size))
+            ]).to(device)
 
             batch_images, midpoint_images, mn_images = sampler(x_T.to(device))
 
@@ -91,7 +92,6 @@ def evaluate(sampler, model, gan):
 
         images = torch.cat(images, dim=0).numpy()
     model.train()
-    gan.train()
     (IS, IS_std), FID = get_inception_and_fid_score(
         images, FLAGS.fid_cache, num_images=FLAGS.num_images,
         use_torch=FLAGS.fid_use_torch, verbose=True)
@@ -100,7 +100,7 @@ def evaluate(sampler, model, gan):
 
 def eval():
     run = wandb.init(
-        project="ddpm-spatial-eval",
+        project="stylegan-diffusion",
         entity='treaptofun',
         config=FLAGS.flag_values_dict(),
         name=FLAGS.run_name,
@@ -110,7 +110,6 @@ def eval():
     model = UNet(
         T=1000, ch=128, ch_mult=[1, 2, 2, 2], attn=[1],
         num_res_blocks=2, dropout=0.1, conv_block_name="residual")
-    gan = Generator32(128)
 
     print(int(FLAGS.T * FLAGS.midpoint_ratio))
     sampler = CombinedGaussianDiffusionSampler(
@@ -124,9 +123,8 @@ def eval():
     ckpt_1 = torch.load(FLAGS.ckpt_filename_1)
 
     model.load_state_dict(ckpt_0['ema_model'])
-    gan.load_state_dict(ckpt_1)
 
-    (IS, IS_std), FID, samples = evaluate(sampler, model, gan)
+    (IS, IS_std), FID, samples = evaluate(sampler, model, FLAGS.img_folder)
     wandb.log({"IS(EMA)": IS, "IS_STD(EMA)": IS_std, "FID(EMA)": FID})
     print("Model(EMA): IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
     save_image(
