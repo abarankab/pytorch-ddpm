@@ -267,8 +267,8 @@ class UNet(nn.Module):
                 chs.append(now_ch)
 
         self.middleblocks = nn.ModuleList([
-            get_named_conv_block(conv_block_name, now_ch, now_ch, tdim, dropout, attn=True),
-            get_named_conv_block(conv_block_name, now_ch, now_ch, tdim, dropout, attn=False),
+            get_named_conv_block(conv_block_name, in_ch=now_ch, out_ch=now_ch, tdim=tdim, dropout=dropout, attn=True),
+            get_named_conv_block(conv_block_name, in_ch=now_ch, out_ch=now_ch, tdim=tdim, dropout=dropout, attn=False),
         ])
 
         self.upblocks = nn.ModuleList()

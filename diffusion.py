@@ -14,13 +14,13 @@ def extract(v, t, x_shape):
 
 
 class CombinedGaussianDiffusionSampler(nn.Module):
-    def __init__(self, models, beta_1, beta_T, T, midpoint, img_size=32,
+    def __init__(self, model, beta_1, beta_T, T, midpoint, img_size=32,
                  mean_type='eps', var_type='fixedlarge'):
         assert mean_type in ['xprev' 'xstart', 'epsilon']
         assert var_type in ['fixedlarge', 'fixedsmall']
         super().__init__()
 
-        self.models = nn.ModuleList(models)
+        self.model = model
         self.T = T
         self.midpoint = midpoint
         self.img_size = img_size
@@ -102,23 +102,16 @@ class CombinedGaussianDiffusionSampler(nn.Module):
         }[self.var_type]
         model_log_var = extract(model_log_var, t, x_t.shape)
 
-        if (t >= self.midpoint).all():
-            model_id = 1
-        elif (t < self.midpoint).all():
-            model_id = 0
-        else:
-            raise ValueError()
-
         # Mean parameterization
         if self.mean_type == 'xprev':       # the model predicts x_{t-1}
-            x_prev = self.models[model_id](x_t, t)
+            x_prev = self.model(x_t, t)
             x_0 = self.predict_xstart_from_xprev(x_t, t, xprev=x_prev)
             model_mean = x_prev
         elif self.mean_type == 'xstart':    # the model predicts x_0
-            x_0 = self.models[model_id](x_t, t)
+            x_0 = self.model(x_t, t)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
         elif self.mean_type == 'epsilon':   # the model predicts epsilon
-            eps = self.models[model_id](x_t, t)
+            eps = self.model(x_t, t)
             x_0 = self.predict_xstart_from_eps(x_t, t, eps=eps)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
         else:
@@ -131,11 +124,15 @@ class CombinedGaussianDiffusionSampler(nn.Module):
         """
         Algorithm 2.
         """
+        if self.midpoint == 0:
+            return torch.clip(x_T, -1, 1), torch.clip(x_T, -1, 1), torch.clip(x_T, -1, 1)
+
         noise = torch.randn_like(x_T)
         x_mid = x_T.clone()
+        t_midpoint = x_T.new_ones([x_T.shape[0], ], dtype=torch.long) * (self.midpoint - 1)
         x_t = (
-            extract(self.sqrt_alphas_bar, self.midpoint, x_0.shape) * x_T +
-            extract(self.sqrt_one_minus_alphas_bar, self.midpoint, x_T.shape) * noise)
+            extract(self.sqrt_alphas_bar, t_midpoint, x_T.shape) * x_T +
+            extract(self.sqrt_one_minus_alphas_bar, t_midpoint, x_T.shape) * noise)
         x_mid_noisy = x_t.clone()
 
         for time_step in reversed(range(self.midpoint)):
@@ -148,5 +145,6 @@ class CombinedGaussianDiffusionSampler(nn.Module):
             else:
                 noise = 0
             x_t = mean + torch.exp(0.5 * log_var) * noise
+
         x_0 = x_t
         return torch.clip(x_0, -1, 1), torch.clip(x_mid, -1, 1), torch.clip(x_mid_noisy, -1, 1)

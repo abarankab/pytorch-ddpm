@@ -13,7 +13,6 @@ from torchvision.io import read_image
 
 from diffusion import CombinedGaussianDiffusionSampler
 from model import UNet
-from sngan import Generator32
 from score.both import get_inception_and_fid_score
 
 
@@ -44,7 +43,7 @@ flags.DEFINE_integer('num_workers', 4, help='workers of Dataloader')
 flags.DEFINE_float('ema_decay', 0.9999, help="ema decay rate")
 flags.DEFINE_bool('parallel', False, help='multi gpu training')
 # Logging & Sampling
-flags.DEFINE_string('logdir', './logs/DDPM_CIFAR10_EPS', help='log directory')
+flags.DEFINE_string('logdir', None, help='log directory')
 flags.DEFINE_integer('sample_size', 64, "sampling size of images")
 flags.DEFINE_integer('sample_step', 1000, help='frequency of sampling')
 # Evaluation
@@ -58,23 +57,26 @@ flags.DEFINE_bool('sample_net', False, help='if True also draws samples from net
 flags.DEFINE_bool("log_to_wandb", True, help="if True logs to wandb")
 flags.DEFINE_string("project_name", "ddpm-cifar-2", help="wandb project name")
 flags.DEFINE_string("run_name", datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M"), help="wandb run name")
-flags.DEFINE_string("ckpt_filename_0", None, help="checkpoint filename")
-flags.DEFINE_string("ckpt_filename_1", None, help="checkpoint filename")
-# Surrogate 
-flags.DEFINE_float("midpoint_ratio", None, help="when to switch to different spatial dimension")
-flags.DEFINE_float("img_folder", None, help="path to image folder")
+# Surrogate
+flags.DEFINE_string("diffusion_ckpt", None, help="diffusion checkpoint filename")
+flags.DEFINE_integer("midpoint", None, help="when to switch to different spatial dimension")
+flags.DEFINE_string("img_folder", None, help="path to image folder")
 
 device = torch.device('cuda')
 
 
 def evaluate(sampler, model, folder):
     model.eval()
+    lst = sorted(os.listdir(folder))
     with torch.no_grad():
         images = []
         for i in range(0, FLAGS.num_images, FLAGS.batch_size):
             x_T = torch.stack([
-                read_image(os.path.join(folder, f"{j}.png")) for j in range(i, min(FLAGS.num_images, i + FLAGS.batch_size))
+                read_image(os.path.join(folder, lst[min(j, len(lst) - 1)])) for j in range(i, min(FLAGS.num_images, i + FLAGS.batch_size))
             ]).to(device)
+            x_T = ((x_T / 255) - 0.5) / 0.5
+            print(x_T.shape)
+            print(x_T[0])
 
             batch_images, midpoint_images, mn_images = sampler(x_T.to(device))
 
@@ -100,10 +102,10 @@ def evaluate(sampler, model, folder):
 
 def eval():
     run = wandb.init(
-        project="stylegan-diffusion",
+        project="gan-checks",
         entity='treaptofun',
         config=FLAGS.flag_values_dict(),
-        name=FLAGS.run_name,
+        name=f"{FLAGS.img_folder}-{FLAGS.run_name}",
     )
 
     # model setup
@@ -111,18 +113,18 @@ def eval():
         T=1000, ch=128, ch_mult=[1, 2, 2, 2], attn=[1],
         num_res_blocks=2, dropout=0.1, conv_block_name="residual")
 
-    print(int(FLAGS.T * FLAGS.midpoint_ratio))
+    assert 0 <= FLAGS.midpoint and FLAGS.midpoint < FLAGS.T
+
     sampler = CombinedGaussianDiffusionSampler(
-        model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, midpoint=int(FLAGS.T * FLAGS.midpoint_ratio), img_size=FLAGS.img_size,
+        model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, midpoint=FLAGS.midpoint, img_size=FLAGS.img_size,
         mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
     if FLAGS.parallel:
         sampler = torch.nn.DataParallel(sampler)
 
     # load model and evaluate
-    ckpt_0 = torch.load(FLAGS.ckpt_filename_0)
-    ckpt_1 = torch.load(FLAGS.ckpt_filename_1)
+    diffusion_ckpt = torch.load(FLAGS.diffusion_ckpt)
 
-    model.load_state_dict(ckpt_0['ema_model'])
+    model.load_state_dict(diffusion_ckpt['ema_model'])
 
     (IS, IS_std), FID, samples = evaluate(sampler, model, FLAGS.img_folder)
     wandb.log({"IS(EMA)": IS, "IS_STD(EMA)": IS_std, "FID(EMA)": FID})

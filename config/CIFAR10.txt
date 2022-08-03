@@ -10,13 +10,12 @@
 --ch_mult=2
 --dropout=0.1
 --ema_decay=0.9999
---noeval
 --eval_step=0
---fid_cache=./stats/cifar10.train.npz
+--fid_cache=pytorch-ddpm/stats/cifar10.train.npz
 --nofid_use_torch
 --grad_clip=1.0
 --img_size=32
---logdir=./logs/DDPM_CIFAR10_EPS
+--logdir=logs
 --lr=0.0002
 --mean_type=epsilon
 --num_images=50000
@@ -27,6 +26,8 @@
 --sample_step=1000
 --save_step=50000
 --total_steps=150000
---train
+--notrain
 --var_type=fixedlarge
 --warmup=5000
+--eval
+--diffusion_ckpt=checkpoints/ckpt799999.pt
