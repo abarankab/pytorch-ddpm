@@ -4,6 +4,8 @@ import os
 import warnings
 import datetime
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
+
 from absl import app, flags
 
 import torch
@@ -84,11 +86,14 @@ def infiniteloop(dataloader):
 
 
 def warmup_lr(step):
+    if FLAGS.warmup == 0:
+        return 1
     return min(step, FLAGS.warmup) / FLAGS.warmup
 
 
 def evaluate(sampler, model):
     model.eval()
+
     with torch.no_grad():
         images = []
         desc = "generating images"
@@ -111,6 +116,7 @@ def train():
     dataset = CIFAR10(
         root='./data', train=True, download=True,
         transform=transforms.Compose([
+            transforms.Resize((FLAGS.img_size, FLAGS.img_size)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
@@ -144,9 +150,9 @@ def train():
         ema_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
         FLAGS.mean_type, FLAGS.var_type).to(device)
     if FLAGS.parallel:
-        trainer = torch.nn.DataParallel(trainer)
-        net_sampler = torch.nn.DataParallel(net_sampler)
-        ema_sampler = torch.nn.DataParallel(ema_sampler)
+        trainer = torch.nn.DataParallel(trainer, device_ids=[0, 1, 2, 3])
+        net_sampler = torch.nn.DataParallel(net_sampler, device_ids=[0, 1, 2, 3])
+        ema_sampler = torch.nn.DataParallel(ema_sampler, device_ids=[0, 1, 2, 3])
 
 
     # log setup
@@ -193,7 +199,10 @@ def train():
         loss = trainer(x_0).mean()
         loss.backward()
 
-        loss_compare += trainer.get_true_loss(x_0).mean().item()
+        if not FLAGS.parallel:
+            loss_compare += trainer.get_true_loss(x_0).mean().item()
+        else:
+            loss_compare += trainer.module.get_true_loss(x_0).mean().item()
         n_loss_compare += 1
 
         loss_wandb += loss.item()
@@ -219,7 +228,10 @@ def train():
                 n_test_loss = 0
                 for x, y in test_dataloader:
                     x = x.to(device)
-                    test_loss += trainer.get_true_loss(x).mean().item()
+                    if not FLAGS.parallel:
+                        test_loss += trainer.get_true_loss(x).mean().item()
+                    else:
+                        test_loss += trainer.module.get_true_loss(x).mean().item()
                     n_test_loss += 1
 
                 wandb.log({
@@ -263,9 +275,16 @@ def train():
             with open(os.path.join(FLAGS.logdir, 'eval.txt'), 'a') as f:
                 metrics['step'] = step
                 f.write(json.dumps(metrics) + "\n")
+    
+    return {
+        'net_model': net_model.state_dict(),
+        'ema_model': ema_model.state_dict(),
+        'sched': sched.state_dict(),
+        'optim': optim.state_dict(),
+    }
 
 
-def eval():
+def eval(ckpt=None):
     run = wandb.init(
         project="ddpm-eval",
         entity='treaptofun',
@@ -281,10 +300,11 @@ def eval():
         model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, img_size=FLAGS.img_size,
         mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
     if FLAGS.parallel:
-        sampler = torch.nn.DataParallel(sampler)
+        sampler = torch.nn.DataParallel(sampler, device_ids=[0, 1, 2, 3])
 
     # load model and evaluate
-    ckpt = torch.load(FLAGS.ckpt_filename)
+    if ckpt is None:
+        ckpt = torch.load(FLAGS.ckpt_filename)
 
     if FLAGS.sample_net:
         model.load_state_dict(ckpt['net_model'])
@@ -298,6 +318,7 @@ def eval():
         wandb.log({"samples": [wandb.Image(make_grid(torch.tensor(samples[:256])))]})
 
     model.load_state_dict(ckpt['ema_model'])
+
     (IS, IS_std), FID, samples = evaluate(sampler, model)
     wandb.log({"IS(EMA)": IS, "IS_STD(EMA)": IS_std, "FID(EMA)": FID})
     print("Model(EMA): IS:%6.3f(%.3f), FID:%7.3f" % (IS, IS_std, FID))
@@ -311,11 +332,14 @@ def eval():
 def main(argv):
     # suppress annoying inception_v3 initialization warning
     warnings.simplefilter(action='ignore', category=FutureWarning)
-    if FLAGS.train:
+    if FLAGS.train and FLAGS.eval:
+        ckpt = train()
+        eval(ckpt)
+    elif FLAGS.train:
         train()
-    if FLAGS.eval:
+    elif FLAGS.eval:
         eval()
-    if not FLAGS.train and not FLAGS.eval:
+    else:
         print('Add --train and/or --eval to execute corresponding tasks')
 
 
